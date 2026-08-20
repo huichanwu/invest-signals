@@ -56,8 +56,8 @@ def num(v):
     except ValueError:
         return 0.0
 
-# 抓近三週資料，取最新交易日寫入
-START = "2026-07-20"
+# 抓近 30 天資料（2026/08/20 改為動態起點：缺漏日回補窗，避免固定日期越放越舊）
+START = (pd.Timestamp.today() - pd.Timedelta(days=30)).strftime("%Y-%m-%d")
 
 
 def get_database(database_key: str):
@@ -290,13 +290,36 @@ def notion_row_lookup(database_id, day):
         return "SKIP", 0  # 查詢失敗時寧可跳過，也不製造重複列
 
 
+def existing_dates(database_id) -> set:
+    """回傳 Notion 已有完整資料（外資淨口數非空）的日期集合（2026/08/20 回補改造）"""
+    dates, cursor = set(), None
+    db = notion.databases.retrieve(database_id=database_id)
+    ds_id = db["data_sources"][0]["id"]
+    while True:
+        body = {"page_size": 100}
+        if cursor:
+            body["start_cursor"] = cursor
+        resp = notion.request(path=f"data_sources/{ds_id}/query", method="POST", body=body)
+        for page in resp["results"]:
+            prop = page["properties"].get("資料日期", {}).get("date")
+            filled = (page["properties"].get("外資淨口數") or {}).get("number")
+            if prop and prop.get("start") and filled is not None:
+                dates.add(prop["start"][:10])
+        if not resp.get("has_more"):
+            return dates
+        cursor = resp["next_cursor"]
+
+
 def create_tw_daily_chips_row():
     """
-    從網路抓最新交易日的實際籌碼資料，寫入「每日籌碼訊號」。
-    1. 外資淨口數／外資日增減：FinMind（期交所三大法人期貨）
-    2. 特法淨部位：期交所官方 OpenAPI（大額交易人未沖銷部位）
-    3. 融資維持率：證交所官方 JSON API＋M平方式公式（上市融資市值／融資餘額）
-    連三日降等布林訊號需要跨日邏輯，留到 D7 的 signal_tw_l0.py 再算。
+    2026/08/20 回補改造：不再只寫「最新一個交易日」，而是掃出抓取範圍內
+    Notion 缺漏的交易日全部補寫——排程漏跑，隔天執行會自動補回（如 8/18 事件）。
+    1. 外資淨口數／外資日增減：FinMind（可回溯日期區間，回補的主資料）
+    2. 特法淨部位：期交所 OpenAPI 只回最新一天 → 只有基準日填得到，
+       回補的舊日期留空，需要時再用 backfill.py 補歷史
+    3. 融資維持率：證交所 JSON API 可指定日期，逐日補算
+    連三日降等布林訊號一樣留給 D7 的 signal_tw_l0.py。
+    回傳 [(day, r, ratio, response), ...]，日期由舊到新。
     """
     database_id = DB_IDS.get("tw_daily_chips")
 
@@ -305,110 +328,93 @@ def create_tw_daily_chips_row():
 
     lt = fetch_large_traders()
     df = fetch_foreign().join(lt, how="left")
+
     # 基準日＝特法資料的日期：期交所 OpenAPI 更新最慢（隔日清晨），
-    # 以它為準時，外資（當日 15:00）與融資（當晚 21:00）一定都已公布，
-    # 不論早上或晚上執行，三個欄位都能齊、日期也一致
+    # 只補到基準日為止，確保寫入的每一天三個欄位都已公布（維持 8/15 定案口徑）
     if not lt.empty and lt.index[-1] in df.index:
-        day = lt.index[-1]
+        anchor = lt.index[-1]
     else:
-        day = df.index[-1]  # 特法抓不到時退回外資最新交易日
+        anchor = df.index[-1]  # 特法抓不到時退回外資最新交易日
         if not lt.empty:
-            print(f"提醒：特法資料日期 {lt.index[-1]} 不在外資資料範圍，改用 {day}")
-    r = df.loc[day]
+            print(f"提醒：特法資料日期 {lt.index[-1]} 不在外資資料範圍，改用 {anchor}")
 
-    try:
-        ratio = mm_ratio(day)
-    except Exception as exc:
-        print("融資維持率抓取失敗，先寫入空值：", exc)
-        ratio = None
+    # 回補的關鍵：不是只看最新一天，而是掃出範圍內所有缺漏日
+    done = existing_dates(database_id)
+    todo = sorted(d for d in df.index if d <= anchor and d not in done)
+    if not todo:
+        print("[SKIP] Notion 已是最新，沒有缺漏的交易日")
+        return []
 
-    # ===== D3 新增：本地 CSV 留存（2026/08/07）=====
-    csv_dir = BASE_DIR / "data" / "taifex"
-    csv_dir.mkdir(parents=True, exist_ok=True)  # 資料夾不存在會自動建立
-    csv_path = csv_dir / f"{day.replace('-', '')}.csv"
+    results = []
+    for day in todo:
+        r = df.loc[day]
 
-    if csv_path.exists():
-        print(f"CSV 已存在，跳過：{csv_path}")
-    else:
-        row_out = df.loc[[day]].copy()
-        row_out["mm_ratio"] = ratio  # 連融資維持率一起存（2026/08/07 補）
-        row_out.to_csv(csv_path, encoding="utf-8-sig")  # 只存當日一列（2026/08/07 定案）
-        print(f"已留存 CSV：{csv_path}")
-    # ===== D3 新增結束 =====
+        try:
+            ratio = mm_ratio(day)
+        except Exception as exc:
+            print(f"{day} 融資維持率抓取失敗，先寫入空值：", exc)
+            ratio = None
 
-    # ===== 寫入前去重（2026/08/15 改為 upsert：空殼列會補寫數值）=====
-    page_id, existing = notion_row_lookup(database_id, day)
-    if page_id and existing is not None:
-        print(f"資料庫已有 {day} 的完整資料，跳過 Notion 寫入（避免重複列）")
-        return day, r, ratio, None
-    # ===== 去重結束 =====
+        # ===== D3 的本地 CSV 留存（一日一檔，邏輯不變）=====
+        csv_dir = BASE_DIR / "data" / "taifex"
+        csv_dir.mkdir(parents=True, exist_ok=True)  # 資料夾不存在會自動建立
+        csv_path = csv_dir / f"{day.replace('-', '')}.csv"
+        if csv_path.exists():
+            print(f"CSV 已存在，跳過：{csv_path}")
+        else:
+            row_out = df.loc[[day]].copy()
+            row_out["mm_ratio"] = ratio
+            row_out.to_csv(csv_path, encoding="utf-8-sig")
+            print(f"已留存 CSV：{csv_path}")
 
-    props = {
-            # title 欄位：你的資料庫裡叫「日期」
-            "日期": {
-                "title": [
-                    {
-                        "text": {
-                            "content": day
-                        }
-                    }
-                ]
-            },
+        # ===== 空殼列 upsert：existing_dates() 只算「外資淨口數非空」的完整列，
+        # 這裡再查一次拿 page_id——空殼列會補寫數值而不是新增重複列 =====
+        page_id, existing = notion_row_lookup(database_id, day)
+        if page_id == "SKIP":
+            print(f"{day} 既有資料查詢失敗，跳過此日")
+            continue
+        if page_id and existing is not None:
+            print(f"資料庫已有 {day} 的完整資料，跳過（避免重複列）")
+            continue
 
-            # date 欄位：你的資料庫裡叫「資料日期」
-            "資料日期": {
-                "date": {
-                    "start": day
-                }
-            },
-
-            # number 欄位：全部是真實市場數據
-            "外資淨口數": {
-                "number": int(r["net_oi"])
-            },
-            "外資日增減": {
-                "number": int(r["delta"]) if pd.notna(r["delta"]) else None
-            },
-            "特法淨部位": {
-                "number": int(r["lt_net"]) if pd.notna(r["lt_net"]) else None
-            },
-            "融資維持率": {
-                "number": ratio
-            },
-
+        note = "每日寫入（notion_writer.py）" if day == anchor else "缺漏日自動回補（notion_writer.py）"
+        props = {
+            "日期": {"title": [{"text": {"content": day} }] },
+            "資料日期": {"date": {"start": day}},
+            "外資淨口數": {"number": int(r["net_oi"])},
+            "外資日增減": {"number": int(r["delta"]) if pd.notna(r["delta"]) else None},
+            "特法淨部位": {"number": int(r["lt_net"]) if pd.notna(r["lt_net"]) else None},
+            "融資維持率": {"number": ratio},
             # checkbox 欄位：布林訊號留給 D7 的 signal_tw_l0.py，先保持未勾
-            "事件窗": {
-                "checkbox": False
-            },
-            "連三日降": {
-                "checkbox": False
-            },
-            "維持率止穩": {
-                "checkbox": False
-            },
-            "特法翻正站穩": {
-                "checkbox": False
-            },
+            "事件窗": {"checkbox": False},
+            "連三日降": {"checkbox": False},
+            "維持率止穩": {"checkbox": False},
+            "特法翻正站穩": {"checkbox": False},
+            "備註": {"rich_text": [{"text": {"content": note} }] },
+        }
 
-            # rich_text 欄位：你的資料庫裡叫「備註」
-            "備註": {
-                "rich_text": [
-                    {
-                        "text": {
-                            "content": "D2 串接驗證：期交所×FinMind 實際資料"
-                        }
-                    }
-                ]
-            },
-    }
+        if page_id:
+            response = notion.pages.update(page_id=page_id, properties=props)
+            print(f"{day} 已有空殼列（別的腳本先建），已補寫數值")
+        else:
+            response = notion.pages.create(parent={"database_id": database_id}, properties=props)
 
-    if page_id:
-        response = notion.pages.update(page_id=page_id, properties=props)
-        print(f"{day} 已有空殼列（別的腳本先建），已補寫數值")
-    else:
-        response = notion.pages.create(parent={"database_id": database_id}, properties=props)
+        # ===== SQL Server 雙寫（2026/08/20 搬進迴圈：回補的日期一併補進 market_chips）=====
+        df_mc = pd.DataFrame([{
+            "date": day,                                                              # 'YYYY-MM-DD'
+            "foreign_futures_net": int(r["net_oi"]),                                  # 外資淨口數
+            "foreign_net_change": int(r["delta"]) if pd.notna(r["delta"]) else None,  # 外資日增減
+            "top_traders_net": int(r["lt_net"]) if pd.notna(r["lt_net"]) else None,   # 特法淨部位
+            "margin_balance": _LAST_MARGIN_BALANCE if ratio is not None else None,    # 大盤融資餘額（元）
+            "margin_maintenance": ratio,                                              # 自家口徑維持率
+        }])
+        upsert_rows("market_chips", df_mc)
+        print(f"[OK] {day} 已寫入 Notion＋SQL Server market_chips")
 
-    return day, r, ratio, response
+        results.append((day, r, ratio, response))
+
+    print(f"本次共補寫 {len(results)} 個交易日（{todo[0]} ~ {todo[-1]}）")
+    return results
 
 
 if __name__ == "__main__":
@@ -418,27 +424,13 @@ if __name__ == "__main__":
     print("資料庫名稱：", db["title"][0]["plain_text"])
     print("資料庫 ID：", db["id"])
 
-    print("\n=== Step 2：抓取最新籌碼資料並寫入 ===")
-    day, r, ratio, page = create_tw_daily_chips_row()
+    print("\n=== Step 2：掃描缺漏交易日並寫入（含 SQL Server 雙寫）===")
+    results = create_tw_daily_chips_row()
 
-    print("寫入成功！")
-    print("資料日期：", day)
-    print("外資淨口數：", int(r["net_oi"]))
-    print("外資日增減：", int(r["delta"]) if pd.notna(r["delta"]) else None)
-    print("特法淨部位：", int(r["lt_net"]) if pd.notna(r["lt_net"]) else None)
-    print("融資維持率：", ratio)
-    print("頁面 URL：", page["url"] if page else "（已存在，本次跳過寫入）")
-
-    # ===== SQL Server 留存（2026/08/19 修正：搬進 main、改用實際存在的變數）=====
-    # 原本掛在檔案最外層且用了未定義的 day_iso 等變數，執行會 NameError，
-    # 連 backfill.py import 本檔時也會觸發；Notion 端跳過寫入時這裡照樣 upsert（不會重複）
-    df_mc = pd.DataFrame([{
-        "date": day,                                                              # 'YYYY-MM-DD'
-        "foreign_futures_net": int(r["net_oi"]),                                  # 外資淨口數
-        "foreign_net_change": int(r["delta"]) if pd.notna(r["delta"]) else None,  # 外資日增減
-        "top_traders_net": int(r["lt_net"]) if pd.notna(r["lt_net"]) else None,   # 特法淨部位
-        "margin_balance": _LAST_MARGIN_BALANCE,                                   # 大盤融資餘額（元）
-        "margin_maintenance": ratio,                                              # 自家口徑維持率
-    }])
-    upsert_rows("market_chips", df_mc)
-    print("SQL Server 已 upsert market_chips 一列")
+    for day, r, ratio, page in results:
+        print(f"--- {day} ---")
+        print("外資淨口數：", int(r["net_oi"]))
+        print("外資日增減：", int(r["delta"]) if pd.notna(r["delta"]) else None)
+        print("特法淨部位：", int(r["lt_net"]) if pd.notna(r["lt_net"]) else None)
+        print("融資維持率：", ratio)
+        print("頁面 URL：", page["url"])
