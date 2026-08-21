@@ -39,12 +39,12 @@ invest-signals/
 │   ├─ fetch_price.py         價量抓取（yfinance / twstock）
 │   ├─ fetch_stock_chips.py   個股三大法人＋融資融券（證交所）
 │   ├─ fetch_tdcc.py          集保股權分散表（千張／400張大戶比率）
-│   ├─ plot_stock_charts.py   籌碼組合圖（Plotly 互動版，嵌入 Notion）
+│   ├─ plot_stock_charts.py   價量籌碼組合圖 ×5（K線×BOLL＋動能KD/RSI/MACD＋籌碼三圖，台美分流）
 │   └─ plotly-finance.min.js  自帶 Plotly 引擎（Notion 沙盒擋 CDN，須注入）
 ├─ transform/
-│   └─ indicators.py          技術指標共用函式（MA5–120、BIAS、BOLL、量能）
+│   └─ indicators.py          技術指標共用函式（MA5–120、BIAS、BOLL、KD、RSI、MACD、量能）
 ├─ notion/
-│   ├─ notion_writer.py       大盤籌碼抓取＋Notion 寫入
+│   ├─ notion_writer.py       大盤籌碼抓取＋缺漏日自動回補（Notion＋SQL Server 雙寫）
 │   └─ backfill.py            歷史回補
 └─ sql/
     ├─ schema.sql             7 張表 DDL
@@ -65,7 +65,7 @@ invest-signals/
 | 請求限速 | 1.5 秒間隔＋失敗 3 次重試，避免對資料源造成負擔 |
 | NaN → NULL | pandas float dtype 會把 None 轉回 NaN，先 `.astype(object)` 再替換，讓缺值正確落成 SQL NULL |
 | 圖表嵌入 | Notion 沙盒會執行檔案內 JS 但擋外部 CDN → Plotly 引擎自帶、以 base64 注入 HTML |
-| 缺漏防復發 | 排程加 `--refill` 回補近 5 天既有列；支援 `--days N` 大範圍歷史回補 |
+| 缺漏防復發 | 個股層：排程加 `--refill` 回補近 5 天既有列、`--days N` 大範圍歷史回補；大盤層：每次執行自動掃描 Notion 缺漏交易日全數補寫並同步 SQL Server（MERGE 冪等，漏跑自癒） |
 | 環境管理 | uv 管理套件與虛擬環境；金鑰全部走 `.env`（不進版控） |
 
 ## 🚀 使用方式
