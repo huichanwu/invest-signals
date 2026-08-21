@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
-r"""plot_stock_charts.py — 互動版（Plotly HTML）籌碼組合圖×4 嵌入 Notion
+r"""plot_stock_charts.py — 互動版（Plotly HTML）組合圖×5 嵌入 Notion
 
+v3（2026/08/21 D19.5）：BOLL 疊進圖①＋新增圖⑤動能副圖（KD/RSI＋MACD）
+  - 指標改用 transform\indicators.py 的 enrich() 一次算完（MA＋BOLL＋KD/RSI/MACD），
+    chart4 回傳 enriched df 給圖⑤重用，不重抓價、不重算
+  - 順序 ①⑤②③④；台股每檔 5 張、美股每檔 2 張（①⑤台美共用）
 v2（2026/08/13 改版）：matplotlib PNG → Plotly 互動 HTML
   - 滑鼠移到圖上浮出當日全部數值（x unified）、滾輪縮放、雙擊還原
   - 新增圖④：K 線×MA5–120×量能（紅漲綠跌；yfinance 現抓原始價，
@@ -9,10 +13,11 @@ v2（2026/08/13 改版）：matplotlib PNG → Plotly 互動 HTML
   - 不再輸出 PNG；HTML 經 File Upload API 上傳，embed.file_upload
     變成 Notion 的 HTML 區塊（沙盒 iframe 內互動）
 
-圖 1：K 線＋MA5/10/20/60/120＋成交量（張）（8/14 移到第一張）
-圖 2：股價（右軸）× 融資／融券／借券賣出餘額（左軸，張）
-圖 3：股價（右軸）× 外資＋投信＋自營買賣超正負堆疊柱（左軸，張／日）
-圖 4：股價（右軸）× 外資／投信(推估)／自營(推估)持股＋千張／400張大戶（左軸，%）
+圖 ①：K 線＋MA5–120＋BOLL(20,2)＋成交量（8/21 疊上 BOLL）
+圖 ⑤：動能副圖——上 KD(9,3,3)×RSI14、下 MACD(12,26,9)（8/21 新增，台美共用）
+圖 ②：股價（右軸）× 融資／融券／借券賣出餘額（左軸，張）
+圖 ③：股價（右軸）× 外資＋投信＋自營買賣超正負堆疊柱（左軸，張／日）
+圖 ④：股價（右軸）× 外資／投信(推估)／自營(推估)持股＋千張／400張大戶（左軸，%）
 
 用法：
     python fetch\plot_stock_charts.py                        # 台股清單全部檔（近 90 天）
@@ -43,7 +48,7 @@ NOTION_VERSION = "2025-09-03"  # 若 embed/file_upload 驗證錯誤：升級 not
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(BASE_DIR))  # 專案根目錄，匯入 fetch_price / indicators
 from fetch.fetch_price import get_price  # noqa: E402
-from transform.indicators import add_ma  # noqa: E402
+from transform.indicators import enrich  # noqa: E402
 
 OUT_DIR = os.path.join(BASE_DIR, "charts")
 LOG_FILE = os.path.join(BASE_DIR, "plot_stock_charts.log")
@@ -296,16 +301,24 @@ def chart3(data, ticker):
 
 
 def chart4(ticker, days, market="台股"):
-    """K 線＋MA＋量能：現抓原始價，MA 與 indicators.py 同一套；回傳 (fig, 筆數)"""
-    df = add_ma(get_price(ticker, days=days + 300, market=market))  # 多抓讓視窗第一根就有 MA120
+    """① K 線＋MA＋BOLL＋量能：現抓原始價，指標用 transform\indicators.py 的 enrich()。
+    回傳 (fig, 筆數, 視窗內 enriched df)——df 交給 chart5 動能副圖重用，不重抓價、不重算。"""
+    df = enrich(get_price(ticker, days=days + 300, market=market))  # 多抓讓第一根就有 MA120／BOLL／KD 暖機
     df = df[df.index >= (pd.Timestamp.today().normalize() - pd.Timedelta(days=days))]
     if df.empty:
-        return None, 0
+        return None, 0, None
     is_tw = (market == "台股")
     sym = df.attrs.get("symbol", ticker)
     x = [d.strftime("%Y-%m-%d") for d in df.index]
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
                         row_heights=[0.72, 0.28], vertical_spacing=0.05)
+    # ── D19.5：BOLL(20,2) 先畫（墊在 K 棒下層），上下軌之間半透明填色；中軌＝MA20 不重複畫 ──
+    fig.add_trace(go.Scatter(x=x, y=df["BOLL下軌"], name="BOLL下軌",
+                             line=dict(width=1, color="#999999", dash="dot"),
+                             showlegend=False), row=1, col=1)
+    fig.add_trace(go.Scatter(x=x, y=df["BOLL上軌"], name="BOLL(20,2)",
+                             line=dict(width=1, color="#999999", dash="dot"),
+                             fill="tonexty", fillcolor="rgba(150,150,150,0.15)"), row=1, col=1)
     fig.add_trace(go.Candlestick(
         x=x, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
         name="K線", increasing_line_color="#d62728", increasing_fillcolor="#d62728",
@@ -320,7 +333,7 @@ def chart4(ticker, days, market="台股"):
     fig.add_trace(go.Bar(x=x, y=vol, name="成交量（%s）" % vol_unit,
                          marker_color=vol_colors), row=2, col=1)
     fig.update_layout(
-        title="%s｜K 線 × MA5–120 × 量能" % sym,
+        title="%s｜K 線 × MA5–120 × BOLL × 量能" % sym,
         template="plotly_white",
         hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
@@ -331,7 +344,39 @@ def chart4(ticker, days, market="台股"):
     fig.update_yaxes(title_text=vol_unit, hoverformat=",.0f", row=2, col=1)
     style_xaxis(fig, x, row=1, col=1)
     style_xaxis(fig, x, row=2, col=1)
-    return fig, len(df)
+    return fig, len(df), df
+
+
+def chart5(df, ticker, name=""):
+    """⑤ 動能副圖：上＝KD＋RSI14（0–100 同刻度，20/50/80 虛線）；下＝MACD（DIF/DEA＋紅綠柱）。
+    df 直接吃 chart4 回傳的 enriched df，台美共用（D19.5 新增）。"""
+    x = [d.strftime("%Y-%m-%d") for d in df.index]
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        row_heights=[0.5, 0.5], vertical_spacing=0.08,
+                        subplot_titles=("KD（9,3,3）× RSI14", "MACD（12,26,9）"))
+    fig.add_trace(go.Scatter(x=x, y=df["K"], name="K", line=dict(color="#1f77b4", width=1.4)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=x, y=df["D"], name="D", line=dict(color="#ff7f0e", width=1.4)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=x, y=df["RSI14"], name="RSI14", line=dict(color="#7b52ab", width=1.4)), row=1, col=1)
+    for lv in (20, 50, 80):
+        fig.add_hline(y=lv, line=dict(color="#bbbbbb", width=0.8, dash="dash"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=x, y=df["DIF"], name="DIF", line=dict(color="#1f77b4", width=1.4)), row=2, col=1)
+    fig.add_trace(go.Scatter(x=x, y=df["DEA"], name="DEA", line=dict(color="#ff7f0e", width=1.4)), row=2, col=1)
+    hist = df["MACD柱"].fillna(0)
+    bar_colors = ["#d62728" if v >= 0 else "#2ca02c" for v in hist]  # 柱>0 紅、<0 綠（目測「紅柱縮短」用）
+    fig.add_trace(go.Bar(x=x, y=df["MACD柱"], name="MACD柱", marker_color=bar_colors), row=2, col=1)
+    fig.add_hline(y=0, line=dict(color="#888888", width=0.8), row=2, col=1)
+    fig.update_layout(
+        title="%s %s｜動能指標：KD × RSI × MACD" % (ticker, name),
+        template="plotly_white",
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        margin=dict(l=60, r=30, t=80, b=40),
+    )
+    fig.update_yaxes(range=[0, 100], hoverformat=".1f", row=1, col=1)
+    fig.update_yaxes(hoverformat="+.2f", row=2, col=1)
+    style_xaxis(fig, x, row=1, col=1)
+    style_xaxis(fig, x, row=2, col=1)
+    return fig
 
 
 # ---------- 上傳與寫回 Notion ----------
@@ -393,7 +438,7 @@ def main():
     parser.add_argument("--days", type=int, default=90, help="回看天數，預設 90")
     parser.add_argument("--local", action="store_true", help="只存本機 HTML、不上傳 Notion（預覽用）")
     parser.add_argument("--market", default="台股", choices=["台股", "美股"],
-                        help="搭配 --ticker 用；美股只畫 K 線圖")
+                        help="搭配 --ticker 用；美股出 ①⑤ 兩張")
     args = parser.parse_args()
 
     load_dotenv(os.path.join(os.path.dirname(BASE_DIR), ".env"))
@@ -413,56 +458,50 @@ def main():
     sections = []
     for it in items:
         ticker, market = it["code"], it["market"]
+
+        # ── ①⑤：台美共用（D19.5：K 線＋BOLL、動能副圖）──
+        figs = []  # (圖, 標籤, 高度)
+        df_k, nbars = None, 0
+        try:
+            fig_k, nbars, df_k = chart4(ticker, args.days, market=market)
+            if fig_k is not None:
+                figs.append((fig_k, "① K線×均線×BOLL×量能", 720))
+        except Exception as e:
+            log.warning("%s K 線圖失敗（%s）", ticker, e)
+        if df_k is not None:
+            figs.append((chart5(df_k, ticker, it.get("name", "")), "⑤ 動能 KD×RSI×MACD", 560))
+
         if market == "美股":
-            # ── 美股：只畫 ① K 線圖（KD/MACD/RSI/BIAS/BOLL 副圖等 D13、D14 完成後再補）──
-            try:
-                fig_k, nbars = chart4(ticker, args.days, market="美股")
-            except Exception as e:
-                log.warning("%s 美股 K 線失敗（%s），略過", ticker, e)
-                continue
-            if fig_k is None:
+            if not figs:
                 log.warning("%s 近 %d 天查無資料，略過", ticker, args.days)
                 continue
-            path = os.path.join(OUT_DIR, "chart1_%s.html" % ticker)
-            save_html(fig_k, path, height=720)
-            if args.local:
-                log.info("%s：美股 K 線已存 %s（--local 不上傳）", ticker, OUT_DIR)
+            data = dict(name=it.get("name", ""), dates=["-"] * nbars)
+        else:
+            rows = query_rows(notion, chips_ds, ticker, args.days)
+            if not rows and not figs:
+                log.warning("%s 近 %d 天查無資料，略過（新標的先跑 fetch_stock_chips.py）", ticker, args.days)
                 continue
-            fid = upload_file(token, path, "text/html")
-            us_data = dict(name=it.get("name", ""), dates=["-"] * nbars)
-            sections.append((ticker, us_data, [fid], ["① K線×均線×量能"]))
-            log.info("%s %s：美股 K 線圖上傳完成（%d 根）", ticker, it.get("name", ""), nbars)
-            continue
+            if not rows:
+                log.warning("%s 籌碼查無資料，本檔先出 ①⑤（新標的先跑 fetch_stock_chips.py）", ticker)
+                data = dict(name=it.get("name", ""), dates=["-"] * nbars)
+            else:
+                data = extract(rows)
+                figs.append((chart1(data, ticker), "② 股價×融資融券借券", 560))
+                figs.append((chart2(data, ticker), "③ 股價×法人買賣超", 560))
+                figs.append((chart3(data, ticker), "④ 股價×持股比例", 560))
 
-        # ── 台股：照舊四張 ──
-        rows = query_rows(notion, chips_ds, ticker, args.days)
-        if not rows:
-            log.warning("%s 近 %d 天查無資料，略過（新標的先跑 fetch_stock_chips.py）", ticker, args.days)
-            continue
-        data = extract(rows)
-        figs = []  # (圖, 名稱, 高度)；原名 items，8/15 改名避免與外層迺圈的 items 撞名
-        try:
-            fig_k, _ = chart4(ticker, args.days)
-            if fig_k is not None:
-                figs.append((fig_k, "K線×均線×量能", 720))
-        except Exception as e:
-            log.warning("%s K 線圖失敗（%s），本檔先出籌碼三張", ticker, e)
-        figs.append((chart1(data, ticker), "股價×融資融券借券", 560))
-        figs.append((chart2(data, ticker), "股價×法人買賣超", 560))
-        figs.append((chart3(data, ticker), "股價×持股比例", 560))
-        nums = "①②③④"
         paths, labels = [], []
-        for i, (fig, name, height) in enumerate(figs, start=1):
+        for i, (fig, label, height) in enumerate(figs, start=1):
             path = os.path.join(OUT_DIR, "chart%d_%s.html" % (i, ticker))
             save_html(fig, path, height=height)
             paths.append(path)
-            labels.append("%s %s" % (nums[i - 1], name))
+            labels.append(label)
         if args.local:
             log.info("%s %s：%d 張互動圖已存 %s（--local 不上傳）", ticker, data["name"], len(paths), OUT_DIR)
             continue
         file_ids = [upload_file(token, p, "text/html") for p in paths]
         sections.append((ticker, data, file_ids, labels))
-        log.info("%s %s：%d 筆資料，%d 張互動圖上傳完成", ticker, data["name"], len(data["dates"]), len(file_ids))
+        log.info("%s %s：%d 張互動圖上傳完成", ticker, data["name"], len(file_ids))
 
     if args.local:
         return
