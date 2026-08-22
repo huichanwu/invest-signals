@@ -12,7 +12,7 @@ SQL Server（分析層），取代原本每天手動盤點籌碼的流程。
 
 - 追蹤 **59 檔**標的（台股 29＋美股 30），新增／移除標的免改程式（watchlist 驅動）
 - SQL Server 累計回填 **14,296 列**價量＋**14,296 列**技術指標（schema 共 **7 張表**）
-- 每日兩個時段全自動執行（16:00 行情／22:00 籌碼），零人工介入
+- 每日兩時段＋週六早上一時段全自動執行（16:00 行情／22:00 籌碼／週六 09:00 週頻判定），零人工介入
 
 ## 🏗 系統架構
 
@@ -31,7 +31,7 @@ flowchart LR
 
 ```txt
 invest-signals/
-├─ run_daily.py               ★ 排程總控（--slot day 16:00 / --slot night 22:00）
+├─ run_daily.py               ★ 排程總控（--slot day 16:00 / night 22:00 / sat_am 週六 09:00）
 ├─ db_writer.py               SQL Server 雙寫共用模組（pyodbc + T-SQL MERGE）
 ├─ sync_price.py              股價同步 → Notion
 ├─ backfill_market_chips.py   歷史資料回補（一次性工具）
@@ -72,11 +72,12 @@ invest-signals/
 
 ```bash
 uv sync                                  # 安裝依賴
-uv run python run_daily.py --slot day    # 行情時段（16:00）
-uv run python run_daily.py --slot night  # 籌碼時段（22:00）
+uv run python run_daily.py --slot day     # 行情時段（16:00）
+uv run python run_daily.py --slot night   # 籌碼時段（22:00）
+uv run python run_daily.py --slot sat_am  # 週頻時段（週六 09:00：集保補抓＋大戶線判定）
 ```
 
-搭配 Windows 工作排程器每日自動執行。
+搭配 Windows 工作排程器自動執行（三條任務：每天 16:00、每天 22:00、每週六 09:00）。
 
 ## 📡 資料來源
 
