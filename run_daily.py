@@ -1,12 +1,12 @@
 """
 run_daily.py｜每日訊號管線總控
-執行：uv run run_daily.py --slot day（16:00）／--slot night（22:00）
+執行：uv run run_daily.py --slot day（16:00）／--slot night（22:00）／--slot sat_am（週六 09:00）
 （Task Scheduler 同樣用 uv run 或 venv python，開始位置設專案資料夾）
 原則：
   1. 清單驅動：步驟寫在 STEPS，美股先 enabled=False，D21–D25 完成後改 True 即可
   2. 隔離失敗：每步用 subprocess 跑，單步掛掉記 log、繼續下一步
   3. 全程留痕：logs\run_daily_YYYYMMDD.log
-  4. 時段制：day 跑公布得早的、night 跑 21:30 後才齊的與所有判定，取代原本逐支排程的時間設計
+  4. 時段制：day 跑公布得早的、night 跑 21:30 後才齊的、sat_am 跑週六早上的集保補抓＋大戶線判定，取代原本逐支排程的時間設計
 """
 import datetime as dt
 import logging
@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
-# (名稱, 腳本檔名, 啟用, 時段 "day"=16:00／"night"=22:00, 限定星期(0=週一…5=週六, None=每天), 逾時秒)
+# (名稱, 腳本檔名, 啟用, 時段 "day"=16:00／"night"=22:00／"sat_am"=週六09:00, 限定星期(0=週一…5=週六, None=每天), 逾時秒)
 # 對照 2026/08/20 工作排程器實際任務清單完成（舊任務已全部停用，由本腳本接手）
 STEPS = [
     # ── day 16:00（原 14:00–14:10 時段：期交所盤後、收盤價已齊）──
@@ -31,7 +31,9 @@ STEPS = [
     ("台股L1 集保資料",   "fetch/fetch_tdcc.py",        True,  "night", None, 600),   # 原每日 21:35＋週六 08:30
     ("籌碼組合圖",       "fetch/plot_stock_charts.py", True,  "night", None, 900),   # 原 21:40
     ("台股L1 個股籌碼",   "fetch/fetch_stock_chips.py", True,  "night", None, 900),   # 原 22:00
-    ("台股L1 大戶線判定", "signal_tw_l1.py",            True,  "night", 5,    300),   # 原週六 09:00 → 改週六 night，接在集保之後
+    # ── sat_am 週六 09:00（沿用原週六早上設計：集保週五晚已公布，早上補抓一次再判定，早上就能看到本週判定）──
+    ("台股L1 集保資料(六早)", "fetch/fetch_tdcc.py",     True,  "sat_am", 5,  600),   # 原「集保大戶比」週六 08:35
+    ("台股L1 大戶線判定",   "signal_tw_l1.py",           True,  "sat_am", 5,  300),   # 原「大戶線趨勢判定」週六 09:00
     # ── 美股 L0：尚未整合，先留開關（D21–D25 每完成一支改一支 True；美股收盤在台灣清晨 → day）──
     ("美股L0 情緒三件組", "fetch_us_sentiment.py",      False, "day",   None, 600),
     ("美股L0 市場廣度",   "fetch_us_breadth.py",        False, "day",   None, 600),
